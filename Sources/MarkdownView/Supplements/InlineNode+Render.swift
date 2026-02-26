@@ -25,6 +25,56 @@ extension [MarkdownInlineNode] {
     }
 }
 
+private final class LTXInlineMathAttachment: LTXAttachment {
+    private let attrString: NSAttributedString
+    private let fixedAscent: CGFloat?
+    private let fixedDescent: CGFloat?
+    private var fixedRunDelegate: CTRunDelegate?
+
+    init(
+        attrString: NSAttributedString,
+        fixedAscent: CGFloat? = nil,
+        fixedDescent: CGFloat? = nil
+    ) {
+        self.attrString = attrString
+        self.fixedAscent = fixedAscent
+        self.fixedDescent = fixedDescent
+        super.init()
+    }
+
+    override func attributedStringRepresentation() -> NSAttributedString {
+        attrString
+    }
+
+    override var runDelegate: CTRunDelegate {
+        guard let fixedAscent, let fixedDescent else {
+            return super.runDelegate
+        }
+        if fixedRunDelegate == nil {
+            var callbacks = CTRunDelegateCallbacks(
+                version: kCTRunDelegateVersion1,
+                dealloc: { _ in },
+                getAscent: { refCon in
+                    let attachment = Unmanaged<LTXInlineMathAttachment>.fromOpaque(refCon).takeUnretainedValue()
+                    return attachment.fixedAscent ?? attachment.size.height * 0.9
+                },
+                getDescent: { refCon in
+                    let attachment = Unmanaged<LTXInlineMathAttachment>.fromOpaque(refCon).takeUnretainedValue()
+                    return attachment.fixedDescent ?? attachment.size.height * 0.1
+                },
+                getWidth: { refCon in
+                    let attachment = Unmanaged<LTXInlineMathAttachment>.fromOpaque(refCon).takeUnretainedValue()
+                    return attachment.size.width
+                }
+            )
+
+            let unmanagedSelf = Unmanaged.passUnretained(self)
+            fixedRunDelegate = CTRunDelegateCreate(&callbacks, unmanagedSelf.toOpaque())
+        }
+        return fixedRunDelegate!
+    }
+}
+
 extension MarkdownInlineNode {
     func render(theme: MarkdownTheme, context: MarkdownTextView.PreprocessedContent, viewProvider: ReusableViewProvider) -> NSAttributedString {
         assert(Thread.isMainThread)
@@ -105,6 +155,7 @@ extension MarkdownInlineNode {
         case let .math(content, replacementIdentifier):
             // Get LaTeX content from rendered context or fallback to raw content
             let latexContent = context.rendered[replacementIdentifier]?.text ?? content
+            let inlineMathVerticalAlignment = theme.inlineMathVerticalAlignment
 
             if let item = context.rendered[replacementIdentifier], let image = item.image {
                 var imageSize = image.size
@@ -112,26 +163,40 @@ extension MarkdownInlineNode {
                 let drawingCallback = LTXLineDrawingAction { context, line, lineOrigin in
                     let glyphRuns = CTLineGetGlyphRuns(line) as NSArray
                     var runOffsetX: CGFloat = 0
+                    var targetRun: CTRun?
                     for i in 0 ..< glyphRuns.count {
                         let run = glyphRuns[i] as! CTRun
                         let attributes = CTRunGetAttributes(run) as! [NSAttributedString.Key: Any]
                         if attributes[.contextIdentifier] as? String == replacementIdentifier {
+                            targetRun = run
                             break
                         }
                         runOffsetX += CTRunGetTypographicBounds(run, CFRange(location: 0, length: 0), nil, nil, nil)
                     }
 
+                    guard let targetRun else { return }
+
                     var ascent: CGFloat = 0
                     var descent: CGFloat = 0
                     CTLineGetTypographicBounds(line, &ascent, &descent, nil)
-                    if imageSize.height > ascent { // we only draw above the line
-                        let newWidth = imageSize.width * (ascent / imageSize.height)
-                        imageSize = CGSize(width: newWidth, height: ascent)
+
+                    var drawY = lineOrigin.y
+                    switch inlineMathVerticalAlignment {
+                    case .bottom:
+                        if imageSize.height > ascent { // we only draw above the line
+                            let newWidth = imageSize.width * (ascent / imageSize.height)
+                            imageSize = CGSize(width: newWidth, height: ascent)
+                        }
+                    case .center:
+                        var runAscent: CGFloat = 0
+                        var runDescent: CGFloat = 0
+                        _ = CTRunGetTypographicBounds(targetRun, CFRange(location: 0, length: 0), &runAscent, &runDescent, nil)
+                        drawY = lineOrigin.y - runDescent
                     }
 
                     let rect = CGRect(
                         x: lineOrigin.x + runOffsetX,
-                        y: lineOrigin.y,
+                        y: drawY,
                         width: imageSize.width,
                         height: imageSize.height
                     )
@@ -158,7 +223,26 @@ extension MarkdownInlineNode {
 
                     context.restoreGState()
                 }
-                let attachment = LTXAttachment.hold(attrString: .init(string: latexContent))
+                let attachment: LTXAttachment
+                switch inlineMathVerticalAlignment {
+                case .bottom:
+                    attachment = LTXAttachment.hold(attrString: .init(string: latexContent))
+                case .center:
+                    let textAscent = max(theme.fonts.body.ascender, 0)
+                    let textDescent = max(-theme.fonts.body.descender, 0)
+                    let textCenterOffset = (textAscent - textDescent) * 0.5
+
+                    let halfHeight = imageSize.height * 0.5
+                    var attachmentAscent = halfHeight + textCenterOffset
+                    attachmentAscent = min(max(0, attachmentAscent), imageSize.height)
+                    let attachmentDescent = imageSize.height - attachmentAscent
+
+                    attachment = LTXInlineMathAttachment(
+                        attrString: .init(string: latexContent),
+                        fixedAscent: attachmentAscent,
+                        fixedDescent: attachmentDescent
+                    )
+                }
                 attachment.size = imageSize
 
                 let attributes: [NSAttributedString.Key: Any] = [

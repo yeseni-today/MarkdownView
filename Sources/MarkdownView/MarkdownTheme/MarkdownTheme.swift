@@ -17,6 +17,11 @@ import Litext
 public extension MarkdownTheme {
     static var `default`: MarkdownTheme = .init()
     static let codeScale = 0.85
+
+    enum InlineMathVerticalAlignment: Equatable {
+        case bottom
+        case center
+    }
 }
 
 public struct MarkdownTheme: Equatable {
@@ -126,6 +131,8 @@ public struct MarkdownTheme: Equatable {
     }
 
     public var table: Table = .init()
+
+    public var inlineMathVerticalAlignment: InlineMathVerticalAlignment = .bottom
 
     public init() {}
 }
